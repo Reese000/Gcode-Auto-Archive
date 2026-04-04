@@ -27,6 +27,9 @@ $script:ConfigPath = Join-Path $env:APPDATA "GcodeArchiveWatcher\config.xml"
 $script:ScriptPath = $MyInvocation.MyCommand.Path
 $script:LogFile = Join-Path $PSScriptRoot "watcher.log"
 $script:MainForm = $null
+# Constants
+$script:MaxBasenameLength = 100
+$script:MaxTrayTextLength = 63
 #endregion
 
 #region Functions
@@ -179,8 +182,8 @@ function New-ArchiveFilename {
     if (-not $basename) { $basename = $timestamp + "_gcode" }
     
     # Limit basename length to avoid MAX_PATH issues (leave room for path + .nc)
-    if ($basename.Length -gt 100) {
-        $basename = $basename.Substring(0, 100)
+    if ($basename.Length -gt $script:MaxBasenameLength) {
+        $basename = $basename.Substring(0, $script:MaxBasenameLength)
     }
     
     $archiveDir = Join-Path $script:Context.ArchiveRoot $dateFolder
@@ -274,6 +277,19 @@ function Archive-File {
             throw "Failed to copy after $maxRetries attempts"
         }
         
+        # Verify copy integrity by comparing file sizes
+        try {
+            $srcInfo = Get-Item $FilePath -ErrorAction Stop
+            $dstInfo = Get-Item $destPath -ErrorAction Stop
+            if ($srcInfo.Length -ne $dstInfo.Length) {
+                Remove-Item $destPath -Force -ErrorAction SilentlyContinue
+                throw "File size mismatch: source $($srcInfo.Length) bytes vs destination $($dstInfo.Length) bytes"
+            }
+        } catch {
+            if (Test-Path $destPath) { Remove-Item $destPath -Force -ErrorAction SilentlyContinue }
+            throw "Copy validation failed: $_"
+        }
+        
         $script:ArchiveCount++
         $script:LastArchived = $destPath
         
@@ -303,19 +319,19 @@ function Update-TrayIcon {
         if ($script:LastArchived) {
             $lastFile = Split-Path $script:LastArchived -Leaf
             $potential = "$iconText`nLast: $lastFile"
-            if ($potential.Length -gt 63) {
-                $available = 63 - ($iconText.Length + 6)
+            if ($potential.Length -gt $script:MaxTrayTextLength) {
+                $available = $script:MaxTrayTextLength - ($iconText.Length + 6)
                 if ($available -gt 3) {
-                    $lastFile = $lastFile.Substring(0, $available - 1) + "…"
+                    $lastFile = $lastFile.Substring(0, $available - 1) + "..."
                 } else {
-                    $lastFile = "…"
+                    $lastFile = "..."
                 }
             }
             $iconText += "`nLast: $lastFile"
         }
         # Final truncation to ensure within limit
-        if ($iconText.Length -gt 63) {
-            $iconText = $iconText.Substring(0, 63)
+        if ($iconText.Length -gt $script:MaxTrayTextLength) {
+            $iconText = $iconText.Substring(0, $script:MaxTrayTextLength)
         }
         $script:Notifier.Text = $iconText
     }
@@ -661,9 +677,7 @@ function Set-AutoStart {
         $wsh = New-Object -ComObject WScript.Shell
         $shortcut = $wsh.CreateShortcut($shortcutPath)
         $shortcut.TargetPath = "powershell.exe"
-        # Properly quote the file path to handle spaces
-        $quotedPath = $targetPath.Replace('"', '\"')
-        $shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$quotedPath`" -StartNow"
+        $shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$targetPath`" -StartNow"
         $shortcut.WorkingDirectory = Split-Path $targetPath -Parent
         $shortcut.IconLocation = $targetPath
         $shortcut.Save()
@@ -707,7 +721,7 @@ $script:Notifier = Create-TrayIcon
 
 if ($script:Context.AutoStart) { Set-AutoStart }
 
-if ($StartNow -or $true) {
+if ($StartNow) {
     Write-Log "=== G-Code Archive Watcher Starting ==="
     if (Start-Watcher) {
         Write-Host "G-Code Archive Watcher started" -ForegroundColor Green
@@ -719,9 +733,20 @@ if ($StartNow -or $true) {
         Write-Host "Press Ctrl+C to exit" -ForegroundColor Yellow
     } else {
         Write-Host "Watcher already running or failed to start." -ForegroundColor Red
+        Show-BalloonTip "Watcher Failed" "Could not start the watcher. Check log for details." 2
     }
 }
 
+# Ensure we have a form for the message loop, even if watcher not started
+if (-not $script:MainForm) {
+    $script:MainForm = New-Object System.Windows.Forms.Form
+    $script:MainForm.ShowInTaskbar = $false
+    $script:MainForm.WindowState = 'Minimized'
+    $script:MainForm.Size = New-Object System.Drawing.Size(0,0)
+    $script:MainForm.FormBorderStyle = 'None'
+    $script:MainForm.ShowIcon = $false
+    $script:MainForm.add_Shown({ $script:MainForm.Hide() })
+}
 [System.Windows.Forms.Application]::Run($script:MainForm)
 
 Stop-Watcher
