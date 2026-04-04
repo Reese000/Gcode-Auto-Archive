@@ -403,52 +403,69 @@ function Start-Watcher {
         $script:Timer = New-Object System.Windows.Forms.Timer
         $script:Timer.Interval = 1000
         $timerTickScript = {
-            $script:TimerTickCount++
-            if ($script:Context.WatchAllDrives -and ($script:TimerTickCount % 60 -eq 0)) {
-                # Detect new drives (Fixed or Removable) with same filtering as Start-Watcher
-                $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { 
-                    $_.Root -match '^[A-Z]:\\$' -and 
-                    ($_.DisplayRoot -eq $null -or $_.DisplayRoot -notlike '\\*') -and
-                    ($_.Description -notlike 'CD-ROM*') 
-                } | ForEach-Object { $_.Root }
-                if ($drives.Count -eq 0) {
-                    $drives = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -in @(2,3) } | ForEach-Object { $_.DeviceID + '\' }
-                }
-                foreach ($drive in $drives) {
-                    $driveKey = $drive.ToLowerInvariant()
-                    if (-not $script:WatchedDrives.ContainsKey($driveKey)) {
-                        Write-Log "New drive detected: $drive"
-                        $script:WatchedDrives[$driveKey] = $true
-                        $script:WatchPaths += $drive
-                        if (Test-Path $drive) {
-                            Get-ChildItem $drive -Filter *.nc -File -ErrorAction SilentlyContinue | ForEach-Object {
-                                $key = $_.FullName.ToLowerInvariant()
-                                [System.Threading.Monitor]::Enter($script:KnownFilesLock)
-                                try {
-                                    if (-not $script:KnownFiles.ContainsKey($key)) {
-                                        $script:KnownFiles[$key] = $_.LastWriteTimeUtc
+            try {
+                $script:TimerTickCount++
+                if ($script:Context.WatchAllDrives -and ($script:TimerTickCount % 60 -eq 0)) {
+                    # Detect new drives (Fixed or Removable) with same filtering as Start-Watcher
+                    $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { 
+                        $_.Root -match '^[A-Z]:\\$' -and 
+                        ($_.DisplayRoot -eq $null -or $_.DisplayRoot -notlike '\\*') -and
+                        ($_.Description -notlike 'CD-ROM*') 
+                    } | ForEach-Object { $_.Root }
+                    if ($drives.Count -eq 0) {
+                        $drives = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -in @(2,3) } | ForEach-Object { $_.DeviceID + '\' }
+                    }
+                    foreach ($drive in $drives) {
+                        $driveKey = $drive.ToLowerInvariant()
+                        if (-not $script:WatchedDrives.ContainsKey($driveKey)) {
+                            Write-Log "New drive detected: $drive"
+                            $script:WatchedDrives[$driveKey] = $true
+                            $script:WatchPaths += $drive
+                            if (Test-Path $drive) {
+                                Get-ChildItem $drive -Filter *.nc -File -ErrorAction SilentlyContinue | ForEach-Object {
+                                    $key = $_.FullName.ToLowerInvariant()
+                                    [System.Threading.Monitor]::Enter($script:KnownFilesLock)
+                                    try {
+                                        if (-not $script:KnownFiles.ContainsKey($key)) {
+                                            $script:KnownFiles[$key] = $_.LastWriteTimeUtc
+                                        }
+                                    }
+                                    finally {
+                                        [System.Threading.Monitor]::Exit($script:KnownFilesLock)
                                     }
                                 }
-                                finally {
-                                    [System.Threading.Monitor]::Exit($script:KnownFilesLock)
-                                }
                             }
+                            Write-Log "Now watching $drive"
                         }
-                        Write-Log "Now watching $drive"
                     }
                 }
-            }
-            foreach ($path in $script:WatchPaths) {
-                if (Test-Path $path) {
-                    try { Check-ForNewFiles -WatchPath $path } catch { Write-Log "Tick error for $path`: $_" }
-                } else {
-                    # Drive removed - cleanup
-                    $pathKey = $path.ToLowerInvariant()
-                    if ($script:WatchedDrives.ContainsKey($pathKey)) {
-                        Write-Log "Drive removed: $path"
-                        $script:WatchedDrives.Remove($pathKey) | Out-Null
-                        [System.Threading.Monitor]::Enter($script:KnownFilesLock)
-                        try {
+                
+                # Check existing watch paths for files and removed drives
+                $pathsToRemove = @()
+                foreach ($path in $script:WatchPaths) {
+                    if (Test-Path $path) {
+                        try { 
+                            Check-ForNewFiles -WatchPath $path 
+                        } catch { 
+                            Write-Log "Tick error for $path`: $_" 
+                        }
+                    } else {
+                        # Drive removed - mark for cleanup
+                        $pathKey = $path.ToLowerInvariant()
+                        if ($script:WatchedDrives.ContainsKey($pathKey)) {
+                            Write-Log "Drive removed: $path"
+                            $pathsToRemove += $path
+                        }
+                    }
+                }
+                
+                # Remove defunct drives after iteration (avoid modifying collection during foreach)
+                if ($pathsToRemove.Count -gt 0) {
+                    [System.Threading.Monitor]::Enter($script:KnownFilesLock)
+                    try {
+                        foreach ($path in $pathsToRemove) {
+                            $pathKey = $path.ToLowerInvariant()
+                            $script:WatchedDrives.Remove($pathKey) | Out-Null
                             # Remove all KnownFiles entries for this drive
                             $keysToRemove = @()
                             foreach ($kvp in $script:KnownFiles.GetEnumerator()) {
@@ -460,12 +477,15 @@ function Start-Watcher {
                                 $script:KnownFiles.Remove($k) | Out-Null
                             }
                         }
-                        finally {
-                            [System.Threading.Monitor]::Exit($script:KnownFilesLock)
-                        }
-                        $script:WatchPaths = $script:WatchPaths | Where-Object { $_ -ne $path }
+                        $script:WatchPaths = $script:WatchPaths | Where-Object { $pathsToRemove -notcontains $_ }
+                    }
+                    finally {
+                        [System.Threading.Monitor]::Exit($script:KnownFilesLock)
                     }
                 }
+            }
+            catch {
+                Write-Log "ERROR in timer tick: $_"
             }
         }
         $null = $script:Timer.add_Tick($timerTickScript)
