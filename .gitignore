@@ -1,0 +1,17 @@
+# Generated files
+watcher.log
+gcode_archive/
+gcode_archive_all/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# PowerShell profiles
+*.ps1xml
+*.psm1
+*.psd1
+
+# User-specific config (should stay in AppData)
+# config.xml lives in %APPDATA%, not in repo
