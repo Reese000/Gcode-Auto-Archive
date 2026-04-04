@@ -169,12 +169,16 @@ function New-ArchiveFilename {
     $dateFolder = $Metadata.Timestamp.ToString("yyyy\\MM\\dd")
     
     $parts = @($timestamp)
-    if ($Metadata.ProgramName) { $parts += $Metadata.ProgramName }
+    if ($Metadata.ProgramName) {
+        # Sanitize: remove path separators and control characters, replace invalid filename chars
+        $programNameClean = $Metadata.ProgramName -replace '[\\/:*?"<>|]', '_' -replace '[\x00-\x1F\x7F]', '_'
+        $parts += $programNameClean
+    }
     if ($Metadata.PostVersion) {
         $verClean = $Metadata.PostVersion -replace '[^\w\-]', '_'
         if ($verClean) { $parts += "post_$verClean" }
     }
-    if ($Metadata.Tools -and $Metadata.Tools.Count -gt 0) {
+    if (($Metadata.Tools) -and ($Metadata.Tools.Count -gt 0)) {
         $parts += "tools_" + ($Metadata.Tools -join '_')
     }
     
@@ -190,9 +194,14 @@ function New-ArchiveFilename {
     $fullPath = Join-Path $archiveDir ($basename + ".nc")
     
     $counter = 1
-    while (Test-Path $fullPath) {
+    $maxCounter = 1000
+    while ((Test-Path $fullPath) -and ($counter -lt $maxCounter)) {
         $fullPath = Join-Path $archiveDir ($basename + "_$counter.nc")
         $counter++
+    }
+    
+    if ($counter -ge $maxCounter) {
+        throw "Maximum filename collision attempts reached ($maxCounter). Archive directory may be full or malformed."
     }
     
     return $fullPath, $archiveDir
@@ -241,31 +250,48 @@ function Archive-File {
     Write-Log "Archiving: $((Split-Path $FilePath -Leaf))"
     
     try {
-        $metadata = Get-GcodeMetadata -FilePath $FilePath
+        # Retry metadata extraction up to 3 times if file is locked
+        $metaRetries = 3
+        $metaAttempt = 0
+        $metadata = $null
+        while ($metaAttempt -lt $metaRetries) {
+            try {
+                $metadata = Get-GcodeMetadata -FilePath $FilePath
+                break
+            }
+            catch [System.IO.IOException] {
+                $metaAttempt++
+                if ($metaAttempt -lt $metaRetries) {
+                    Write-Log "Metadata locked, retry $metaAttempt/$metaRetries in 500ms..."
+                    Start-Sleep -Milliseconds 500
+                } else {
+                    throw
+                }
+            }
+        }
+        
         $destPath, $archiveDir = New-ArchiveFilename -SourceFile $FilePath -Metadata $metadata
         
         if (-not (Test-Path $archiveDir)) {
-            # Use -ErrorAction SilentlyContinue to avoid race condition exceptions
             New-Item -ItemType Directory -Path $archiveDir -Force -ErrorAction SilentlyContinue | Out-Null
             if (-not (Test-Path $archiveDir)) {
-                # Double-check creation succeeded
                 Write-Log "Created directory: $archiveDir"
             }
         }
         
         # Retry copy up to 3 times with delay (handle locked files)
-        $retryCount = 0
-        $maxRetries = 3
+        $copyRetries = 3
+        $copyAttempt = 0
         $copied = $false
-        while ($retryCount -lt $maxRetries -and -not $copied) {
+        while (($copyAttempt -lt $copyRetries) -and (-not $copied)) {
             try {
                 Copy-Item $FilePath $destPath -Force -ErrorAction Stop
                 $copied = $true
             }
             catch [System.IO.IOException] {
-                $retryCount++
-                if ($retryCount -lt $maxRetries) {
-                    Write-Log "File locked, retry $retryCount/$maxRetries in 500ms..."
+                $copyAttempt++
+                if ($copyAttempt -lt $copyRetries) {
+                    Write-Log "File locked, retry $copyAttempt/$copyRetries in 500ms..."
                     Start-Sleep -Milliseconds 500
                 } else {
                     throw
@@ -274,7 +300,7 @@ function Archive-File {
         }
         
         if (-not $copied) {
-            throw "Failed to copy after $maxRetries attempts"
+            throw "Failed to copy after $copyRetries attempts"
         }
         
         # Verify copy integrity by comparing file sizes
@@ -356,16 +382,8 @@ function Start-Watcher {
         
         $watchPaths = @()
         if ($script:Context.WatchAllDrives) {
-            # Get only Fixed and Removable drives, exclude network/cd-rom
-            $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { 
-                $_.Root -match '^[A-Z]:\\$' -and 
-                ($_.DisplayRoot -eq $null -or $_.DisplayRoot -notlike '\\*') -and
-                ($_.Description -notlike 'CD-ROM*') 
-            } | ForEach-Object { $_.Root }
-            # Fallback to just checking DriveType if provider filtering insufficient
-            if ($drives.Count -eq 0) {
-                $drives = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -in @(2,3) } | ForEach-Object { $_.DeviceID + '\' }
-            }
+            # Get only Fixed (3) and Removable (2) drives using WMI for consistency
+            $drives = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -in @(2,3) } | ForEach-Object { $_.DeviceID + '\' }
             $watchPaths = $drives
             Write-Log "Watching all drives: $($drives -join ', ')"
         } else {
@@ -405,45 +423,49 @@ function Start-Watcher {
         $timerTickScript = {
             try {
                 $script:TimerTickCount++
-                if ($script:Context.WatchAllDrives -and ($script:TimerTickCount % 60 -eq 0)) {
-                    # Detect new drives (Fixed or Removable) with same filtering as Start-Watcher
-                    $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { 
-                        $_.Root -match '^[A-Z]:\\$' -and 
-                        ($_.DisplayRoot -eq $null -or $_.DisplayRoot -notlike '\\*') -and
-                        ($_.Description -notlike 'CD-ROM*') 
-                    } | ForEach-Object { $_.Root }
-                    if ($drives.Count -eq 0) {
+                if ($script:Context.WatchAllDrives) {
+                    # Detect new drives (Fixed or Removable) using consistent WMI method
+                    try {
                         $drives = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -in @(2,3) } | ForEach-Object { $_.DeviceID + '\' }
-                    }
-                    foreach ($drive in $drives) {
-                        $driveKey = $drive.ToLowerInvariant()
-                        if (-not $script:WatchedDrives.ContainsKey($driveKey)) {
-                            Write-Log "New drive detected: $drive"
-                            $script:WatchedDrives[$driveKey] = $true
-                            $script:WatchPaths += $drive
-                            if (Test-Path $drive) {
-                                Get-ChildItem $drive -Filter *.nc -File -ErrorAction SilentlyContinue | ForEach-Object {
-                                    $key = $_.FullName.ToLowerInvariant()
-                                    [System.Threading.Monitor]::Enter($script:KnownFilesLock)
-                                    try {
-                                        if (-not $script:KnownFiles.ContainsKey($key)) {
-                                            $script:KnownFiles[$key] = $_.LastWriteTimeUtc
+                        foreach ($drive in $drives) {
+                            $driveKey = $drive.ToLowerInvariant()
+                            if (-not $script:WatchedDrives.ContainsKey($driveKey)) {
+                                Write-Log "New drive detected: $drive"
+                                $script:WatchedDrives[$driveKey] = $true
+                                $script:WatchPaths += $drive
+                                if (Test-Path $drive) {
+                                    Get-ChildItem $drive -Filter *.nc -File -ErrorAction SilentlyContinue | ForEach-Object {
+                                        $key = $_.FullName.ToLowerInvariant()
+                                        [System.Threading.Monitor]::Enter($script:KnownFilesLock)
+                                        try {
+                                            if (-not $script:KnownFiles.ContainsKey($key)) {
+                                                $script:KnownFiles[$key] = $_.LastWriteTimeUtc
+                                            }
+                                        }
+                                        finally {
+                                            [System.Threading.Monitor]::Exit($script:KnownFilesLock)
                                         }
                                     }
-                                    finally {
-                                        [System.Threading.Monitor]::Exit($script:KnownFilesLock)
-                                    }
                                 }
+                                Write-Log "Now watching $drive"
                             }
-                            Write-Log "Now watching $drive"
                         }
+                    } catch {
+                        Write-Log "ERROR: Drive detection failed: $_"
                     }
                 }
                 
                 # Check existing watch paths for files and removed drives
                 $pathsToRemove = @()
                 foreach ($path in $script:WatchPaths) {
-                    if (Test-Path $path) {
+                    $pathExists = $false
+                    try {
+                        $pathExists = Test-Path $path -ErrorAction SilentlyContinue
+                    } catch {
+                        Write-Log "WARNING: Test-Path failed for $path`: $_"
+                    }
+                    
+                    if ($pathExists) {
                         try { 
                             Check-ForNewFiles -WatchPath $path 
                         } catch { 
@@ -669,7 +691,7 @@ function Create-TrayIcon {
     })
     
     $stopItem = $menu.Items.Add("Stop Watching")
-        $stopItem.add_Click({
+    $stopItem.add_Click({
         Stop-Watcher
         Show-BalloonTip "Watcher Stopped" "File monitoring is paused" 2
     })
