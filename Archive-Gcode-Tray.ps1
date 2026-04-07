@@ -20,6 +20,7 @@ $script:WatchPaths = $null
 $script:WatchedDrives = $null
 $script:KnownFiles = $null
 $script:KnownFilesLock = $null
+$script:DriveListLock = $null
 $script:ArchiveCount = 0
 $script:LastArchived = $null
 $script:Status = "Stopped"
@@ -27,6 +28,17 @@ $script:ConfigPath = Join-Path $env:APPDATA "GcodeArchiveWatcher\config.xml"
 $script:ScriptPath = $MyInvocation.MyCommand.Path
 $script:LogFile = Join-Path $PSScriptRoot "watcher.log"
 $script:MainForm = $null
+$script:DriveChangeEventsRegistered = $false
+$script:DriveRefreshInProgress = $false
+$script:TimerElapsedRunning = $false
+$script:MaxArchivesPerTick = 10
+# Cached USB detection state
+$script:CurrentUsbState = $null
+$script:LastIconUsbState = $null
+# Pre-created tray icons (set after function definitions)
+$script:IconGreen = $null
+$script:IconRed = $null
+$script:IconDefault = $null
 # Constants
 $script:MaxBasenameLength = 100
 $script:MaxTrayTextLength = 63
@@ -39,6 +51,25 @@ function Write-Log {
     $logMessage = "[$timestamp] $Message"
     Write-Host $logMessage
     Add-Content -Path $script:LogFile -Value $logMessage -ErrorAction SilentlyContinue
+}
+
+# Pre-created simple colored circle icons (fast)
+function New-ColorIcon {
+    param([System.Drawing.Color]$Color)
+    try {
+        $bmp = New-Object System.Drawing.Bitmap(16,16)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $g.FillEllipse((New-Object System.Drawing.SolidBrush($Color)), 0,0,16,16)
+        $g.Dispose()
+        $hicon = $bmp.GetHicon()
+        $icon = [System.Drawing.Icon]::FromHandle($hicon)
+        # Optionally clone to own the handle? Keep simple for now.
+        return $icon
+    } catch {
+        Write-Log "ERROR: Failed to create color icon: $_"
+        return $null
+    }
 }
 
 function Save-Config {
@@ -121,6 +152,9 @@ function Initialize-Environment {
     
     Write-Log "Initialized: WatchAllDrives=$($script:Context.WatchAllDrives), ArchiveRoot=$($script:Context.ArchiveRoot)"
     Update-TrayIcon
+    
+    # Initialize drive change detection
+    Initialize-DriveWatcher
 }
 
 function Get-GcodeMetadata {
@@ -147,7 +181,7 @@ function Get-GcodeMetadata {
         
         $dateLine = $lines | Select-String -Pattern 'post modified:' | Select-Object -First 1
         if ($dateLine) {
-            $metadata.PostDate = $dateLine.ToString() -replace '.*post modified:\s*', '' -replace '\).*', '' -replace '[/-]', '_'
+            $metadata.PostDate = ($dateLine.ToString() -replace '.*post modified:\s*', '' -replace '\).*', '' -replace '[/-]', '_').Trim()
         }
         
         $toolLines = $lines | Select-String -Pattern '\(T\d+\s+D=' | ForEach-Object {
@@ -213,16 +247,29 @@ function Check-ForNewFiles {
     try {
         if (-not (Test-Path $WatchPath)) { return }
         
-        $files = Get-ChildItem $WatchPath -Filter *.nc -File -ErrorAction SilentlyContinue
+        $files = Get-ChildItem $WatchPath -Filter *.nc -File -Recurse -ErrorAction SilentlyContinue
+        $localArchiveCount = 0
         foreach ($file in $files) {
             if ([string]::IsNullOrWhiteSpace($file.FullName)) { continue }
             
-            $key = $file.FullName.ToLowerInvariant()
+            # Skip files that are inside the archive root to avoid infinite loops
+            $fullPath = $file.FullName
+            if ($fullPath.StartsWith($script:Context.ArchiveRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+            
+            # Throttle: stop if we've archived too many files this call (max per path)
+            if ($localArchiveCount -ge $script:MaxArchivesPerTick) {
+                break
+            }
+            
+            $key = $fullPath.ToLowerInvariant()
             [System.Threading.Monitor]::Enter($script:KnownFilesLock)
             try {
                 if (-not $script:KnownFiles.ContainsKey($key)) {
                     Write-Log "New file: $($file.Name) (from $WatchPath)"
                     $script:KnownFiles[$key] = $file.LastWriteTimeUtc
+                    $localArchiveCount++
                     Archive-File -FilePath $file.FullName
                 } else {
                     $lastWrite = $file.LastWriteTimeUtc
@@ -230,6 +277,7 @@ function Check-ForNewFiles {
                     if ($lastWrite -gt $knownWrite) {
                         Write-Log "Modified: $($file.Name) (from $WatchPath)"
                         $script:KnownFiles[$key] = $lastWrite
+                        $localArchiveCount++
                         Archive-File -FilePath $file.FullName
                     }
                 }
@@ -339,34 +387,83 @@ function Archive-File {
     }
 }
 
+function Get-UsbStateFast {
+    # Fast check: iterate watched paths and see if any is a removable drive (type 2)
+    foreach ($p in $script:WatchPaths) {
+        $drive = $p.TrimEnd('\')
+        if ($drive -match '^[A-Z]:$') {
+            try {
+                $disk = Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='$drive'" -ErrorAction SilentlyContinue
+                if ($disk -and $disk.DriveType -eq 2) { return $true }
+            } catch { }
+        }
+    }
+    return $false
+}
+
 function Update-TrayIcon {
-    if ($script:Notifier) {
+    # Exit early if notifier not ready
+    if (-not $script:Notifier) { return }
+
+    # Marshal to UI thread if needed
+    if ($script:MainForm -and $script:MainForm.InvokeRequired) {
+        try {
+            $null = $script:MainForm.BeginInvoke([Action]{ Update-TrayIcon })
+        } catch { }
+        return
+    }
+
+    try {
+        $usbDetected = $script:CurrentUsbState
+
+        # Only change icon if state changed
+        if ($usbDetected -ne $script:LastIconUsbState) {
+            $newIcon = if ($usbDetected) { $script:IconGreen } else { $script:IconRed }
+            if ($newIcon -and $newIcon -ne $script:Notifier.Icon) {
+                $script:Notifier.Icon = $newIcon
+                Write-Log "Icon set to: $(if($usbDetected){'GREEN'}else{'RED'})"
+            }
+        }
+        # Always update last observed state
+        $script:LastIconUsbState = $usbDetected
+
+        # Update tooltip text only (fast)
         $iconText = "G-Code Archive`nStatus: $script:Status`nArchived: $script:ArchiveCount"
+        $iconText += "`nUSB: $(if($usbDetected){'Connected'}else{'Disconnected'})"
         if ($script:LastArchived) {
             $lastFile = Split-Path $script:LastArchived -Leaf
-            $potential = "$iconText`nLast: $lastFile"
-            if ($potential.Length -gt $script:MaxTrayTextLength) {
-                $available = $script:MaxTrayTextLength - ($iconText.Length + 6)
-                if ($available -gt 3) {
-                    $lastFile = $lastFile.Substring(0, $available - 1) + "..."
-                } else {
-                    $lastFile = "..."
-                }
+            if ("$iconText`nLast: $lastFile".Length -gt $script:MaxTrayTextLength) {
+                $avail = $script:MaxTrayTextLength - ($iconText.Length + 6)
+                if ($avail -gt 3) { $lastFile = $lastFile.Substring(0,$avail-1) + '...' } else { $lastFile = '...' }
             }
             $iconText += "`nLast: $lastFile"
         }
-        # Final truncation to ensure within limit
-        if ($iconText.Length -gt $script:MaxTrayTextLength) {
-            $iconText = $iconText.Substring(0, $script:MaxTrayTextLength)
-        }
+        if ($iconText.Length -gt $script:MaxTrayTextLength) { $iconText = $iconText.Substring(0,$script:MaxTrayTextLength) }
         $script:Notifier.Text = $iconText
+    }
+    catch {
+        Write-Log "WARNING: Update-TrayIcon failed: $_"
     }
 }
 
 function Show-BalloonTip {
     param([string]$Title, [string]$Message, [int]$Icon = 1)
     if ($script:Notifier) {
-        $script:Notifier.ShowBalloonTip(3000, $Title, $Message, $Icon)
+        if ($script:MainForm -and $script:MainForm.InvokeRequired) {
+            try {
+                $script:MainForm.BeginInvoke([Action]{ Show-BalloonTip -Title $Title -Message $Message -Icon $Icon }) | Out-Null
+            }
+            catch {
+                # Swallow exceptions during early startup
+            }
+            return
+        }
+        try {
+            $script:Notifier.ShowBalloonTip(3000, $Title, $Message, $Icon)
+        }
+        catch {
+            # Ignore UI errors
+        }
     }
 }
 
@@ -382,8 +479,7 @@ function Start-Watcher {
         
         $watchPaths = @()
         if ($script:Context.WatchAllDrives) {
-            # Get only Fixed (3) and Removable (2) drives using WMI for consistency
-            $drives = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -in @(2,3) } | ForEach-Object { $_.DeviceID + '\' }
+            $drives = Get-RemovableAndFixedDrives
             $watchPaths = $drives
             Write-Log "Watching all drives: $($drives -join ', ')"
         } else {
@@ -393,6 +489,7 @@ function Start-Watcher {
         
         $script:KnownFiles = @{}
         $script:KnownFilesLock = New-Object Object
+        $script:DriveListLock = New-Object Object
         foreach ($path in $watchPaths) {
             if (Test-Path $path) {
                 Get-ChildItem $path -Filter *.nc -File -ErrorAction SilentlyContinue | ForEach-Object {
@@ -405,114 +502,50 @@ function Start-Watcher {
         }
         Write-Log "Initial scan: $($script:KnownFiles.Count) existing .nc file(s) ignored"
         
+        # Create hidden main form (original pattern)
         $script:MainForm = New-Object System.Windows.Forms.Form
         $script:MainForm.ShowInTaskbar = $false
         $script:MainForm.WindowState = 'Minimized'
-        $script:MainForm.Size = New-Object System.Drawing.Size(0,0)
+        $script:MainForm.Size = New-Object System.Drawing.Size(1,1)
         $script:MainForm.FormBorderStyle = 'None'
         $script:MainForm.ShowIcon = $false
-        $script:MainForm.add_Shown({ $script:MainForm.Hide() })
+        $script:MainForm.add_HandleCreated({
+            Write-Log "MainForm handle created"
+        })
+        $script:MainForm.add_Shown({
+            try {
+                Write-Log "MainForm Shown: Visible=$($script:MainForm.Visible), Handle=$($script:MainForm.IsHandleCreated)"
+                $script:MainForm.Hide()
+                Write-Log "MainForm Hide() called"
+            } catch {
+                Write-Log "ERROR in Shown handler: $_"
+            }
+        })
         
         $script:WatchPaths = $watchPaths
         $script:WatchedDrives = @{}
         foreach ($p in $watchPaths) { $script:WatchedDrives[$p.ToLowerInvariant()] = $true }
         $script:TimerTickCount = 0
         
+        # Determine initial USB detection state
+        $script:CurrentUsbState = Get-UsbStateFast
+        Write-Log "Initial USB state: $script:CurrentUsbState"
+        $script:LastIconUsbState = $null  # Force first icon set
+
+        # Setup timer
+        
+        # Setup timer
         $script:Timer = New-Object System.Windows.Forms.Timer
-        $script:Timer.Interval = 1000
-        $timerTickScript = {
-            try {
-                $script:TimerTickCount++
-                if ($script:Context.WatchAllDrives) {
-                    # Detect new drives (Fixed or Removable) using consistent WMI method
-                    try {
-                        $drives = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -in @(2,3) } | ForEach-Object { $_.DeviceID + '\' }
-                        foreach ($drive in $drives) {
-                            $driveKey = $drive.ToLowerInvariant()
-                            if (-not $script:WatchedDrives.ContainsKey($driveKey)) {
-                                Write-Log "New drive detected: $drive"
-                                $script:WatchedDrives[$driveKey] = $true
-                                $script:WatchPaths += $drive
-                                if (Test-Path $drive) {
-                                    Get-ChildItem $drive -Filter *.nc -File -ErrorAction SilentlyContinue | ForEach-Object {
-                                        $key = $_.FullName.ToLowerInvariant()
-                                        [System.Threading.Monitor]::Enter($script:KnownFilesLock)
-                                        try {
-                                            if (-not $script:KnownFiles.ContainsKey($key)) {
-                                                $script:KnownFiles[$key] = $_.LastWriteTimeUtc
-                                            }
-                                        }
-                                        finally {
-                                            [System.Threading.Monitor]::Exit($script:KnownFilesLock)
-                                        }
-                                    }
-                                }
-                                Write-Log "Now watching $drive"
-                            }
-                        }
-                    } catch {
-                        Write-Log "ERROR: Drive detection failed: $_"
-                    }
-                }
-                
-                # Check existing watch paths for files and removed drives
-                $pathsToRemove = @()
-                foreach ($path in $script:WatchPaths) {
-                    $pathExists = $false
-                    try {
-                        $pathExists = Test-Path $path -ErrorAction SilentlyContinue
-                    } catch {
-                        Write-Log "WARNING: Test-Path failed for $path`: $_"
-                    }
-                    
-                    if ($pathExists) {
-                        try { 
-                            Check-ForNewFiles -WatchPath $path 
-                        } catch { 
-                            Write-Log "Tick error for $path`: $_" 
-                        }
-                    } else {
-                        # Drive removed - mark for cleanup
-                        $pathKey = $path.ToLowerInvariant()
-                        if ($script:WatchedDrives.ContainsKey($pathKey)) {
-                            Write-Log "Drive removed: $path"
-                            $pathsToRemove += $path
-                        }
-                    }
-                }
-                
-                # Remove defunct drives after iteration (avoid modifying collection during foreach)
-                if ($pathsToRemove.Count -gt 0) {
-                    [System.Threading.Monitor]::Enter($script:KnownFilesLock)
-                    try {
-                        foreach ($path in $pathsToRemove) {
-                            $pathKey = $path.ToLowerInvariant()
-                            $script:WatchedDrives.Remove($pathKey) | Out-Null
-                            # Remove all KnownFiles entries for this drive
-                            $keysToRemove = @()
-                            foreach ($kvp in $script:KnownFiles.GetEnumerator()) {
-                                if ($kvp.Key.StartsWith($pathKey, [StringComparison]::OrdinalIgnoreCase)) {
-                                    $keysToRemove += $kvp.Key
-                                }
-                            }
-                            foreach ($k in $keysToRemove) {
-                                $script:KnownFiles.Remove($k) | Out-Null
-                            }
-                        }
-                        $script:WatchPaths = $script:WatchPaths | Where-Object { $pathsToRemove -notcontains $_ }
-                    }
-                    finally {
-                        [System.Threading.Monitor]::Exit($script:KnownFilesLock)
-                    }
-                }
-            }
-            catch {
-                Write-Log "ERROR in timer tick: $_"
-            }
-        }
-        $null = $script:Timer.add_Tick($timerTickScript)
+        $script:Timer.Interval = 2000
+        $null = $script:Timer.add_Tick({ TimerTick })
         $script:Timer.Start()
-        Write-Log "Timer started. Enabled=$($script:Timer.Enabled), Interval=$($script:Timer.Interval)"
+        Write-Log "Timer started (System.Windows.Forms.Timer, Enabled=$($script:Timer.Enabled), Interval=$($script:Timer.Interval)ms)"
+        
+        # Start WMI drive event watcher
+        Start-DriveWatcher
+        
+        # Initial drive detection
+        Refresh-DriveDetection
         
         $script:Status = "Watching"
         Update-TrayIcon
@@ -527,10 +560,19 @@ function Start-Watcher {
 
 function Stop-Watcher {
     if ($script:Timer) {
-        $script:Timer.Stop()
-        $script:Timer.Dispose()
+        try {
+            $script:Timer.Dispose()
+        }
+        catch {
+            # Ignore dispose errors
+        }
         $script:Timer = $null
     }
+    $script:TimerElapsedRunning = $false
+    
+    # Stop WMI drive event watcher
+    Stop-DriveWatcher
+    
     if ($script:MainForm) {
         $script:MainForm.Dispose()
         $script:MainForm = $null
@@ -541,65 +583,54 @@ function Stop-Watcher {
     Write-Log "Watcher stopped"
 }
 
-function Create-TrayIcon {
-    # Create custom icon: folder with gear (archive symbol)
-    $iconSize = 32
-    $bitmap = New-Object System.Drawing.Bitmap($iconSize, $iconSize)
-    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-    $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $graphics.Clear([System.Drawing.Color]::Transparent)
-    
-    # Draw folder body (tabbed folder shape)
-    $folderColor = [System.Drawing.Color]::FromArgb(0, 120, 215) # Blue folder
-    $folderPen = New-Object System.Drawing.Pen($folderColor, 2)
-    $folderBrush = New-Object System.Drawing.SolidBrush($folderColor)
-    
-    $folderRect = New-Object System.Drawing.RectangleF(4, 6, 24, 22)
-    $folderTabRect = New-Object System.Drawing.RectangleF(8, 2, 8, 6)
-    
-    # Folder back
-    $graphics.FillRectangle($folderBrush, $folderRect)
-    $graphics.DrawRectangle($folderPen, $folderRect.X, $folderRect.Y, $folderRect.Width-1, $folderRect.Height-1)
-    
-    # Folder tab
-    $graphics.FillRectangle($folderBrush, $folderTabRect)
-    $graphics.DrawRectangle($folderPen, $folderTabRect.X, $folderTabRect.Y, $folderTabRect.Width-1, $folderTabRect.Height-1)
-    
-    # Draw gear (cog) symbol in center
-    $gearColor = [System.Drawing.Color]::White
-    $gearBrush = New-Object System.Drawing.SolidBrush($gearColor)
-    $gearPen = New-Object System.Drawing.Pen($gearColor, 2)
-    $centerX = 16
-    $centerY = 17
-    $outerRadius = 6
-    $innerRadius = 3
-    $teeth = 6
-    
-    $angleStep = [Math]::PI * 2 / $teeth
-    $points = New-Object System.Collections.Generic.List[System.Drawing.PointF]
-    
-    for ($i = 0; $i -lt $teeth * 2; $i++) {
-        $angle = $i * $angleStep
-        $radius = if ($i % 2 -eq 0) { $outerRadius } else { $innerRadius }
-        $x = $centerX + [Math]::Cos($angle) * $radius
-        $y = $centerY + [Math]::Sin($angle) * $radius
-        $points.Add([System.Drawing.PointF]::new([float]$x, [float]$y))
+function TimerTick {
+    try {
+        $script:TimerTickCount++
+        Write-Log "TimerTick: $script:TimerTickCount"
+        
+        # Queue background work to avoid blocking UI thread
+        $tickCount = $script:TimerTickCount
+        $null = [System.Threading.ThreadPool]::QueueUserWorkItem({
+            param($count)
+            
+            try {
+                # Every 5 ticks (10 seconds) refresh drive list
+                if ($count % 5 -eq 0) {
+                    Write-Log "Background refresh drive detection (tick $count)..."
+                    Refresh-DriveDetection
+                }
+                
+                # Snapshot watch paths (thread-safe)
+                [System.Threading.Monitor]::Enter($script:DriveListLock)
+                try {
+                    $pathsToScan = $script:WatchPaths.Clone()
+                }
+                finally {
+                    [System.Threading.Monitor]::Exit($script:DriveListLock)
+                }
+                
+                foreach ($path in $pathsToScan) {
+                    if (Test-Path $path -ErrorAction SilentlyContinue) {
+                        Check-ForNewFiles -WatchPath $path
+                    }
+                }
+            }
+            catch {
+                Write-Log "ERROR in background tick work: $_"
+            }
+        }, $tickCount)
     }
-    
-    $graphics.FillPolygon($gearBrush, $points.ToArray())
-    $graphics.DrawPolygon($gearPen, $points.ToArray())
-    
-    # Cut out center hole (draw circle with folder color)
-    $holeBrush = New-Object System.Drawing.SolidBrush($folderColor)
-    $graphics.FillEllipse($holeBrush, $centerX - 1.5, $centerY - 1.5, 3, 3)
-    
-    $graphics.Dispose()
-    
-    $iconHandle = $bitmap.GetHicon()
-    $notifyIconIcon = [System.Drawing.Icon]::FromHandle($iconHandle)
+    catch {
+        Write-Log "ERROR in timer tick: $_"
+    }
+}
+
+function Create-TrayIcon {
+    # Use pre-created colored icons; fallback to simple ball if not ready
+    $initialIcon = if ($script:IconGreen) { $script:IconGreen } else { $script:IconRed }
     
     $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
-    $notifyIcon.Icon = $notifyIconIcon
+    $notifyIcon.Icon = $initialIcon
     $notifyIcon.Text = "G-Code Archive Watcher"
     $notifyIcon.Visible = $true
     
@@ -700,6 +731,7 @@ function Create-TrayIcon {
     
     $exitItem = $menu.Items.Add("Exit")
     $exitItem.add_Click({
+        Write-Log "Exit menu item clicked"
         Stop-Watcher
         $notifyIcon.Visible = $false
         $notifyIcon.Dispose()
@@ -713,16 +745,17 @@ function Create-TrayIcon {
 
 function Set-AutoStart {
     $shortcutPath = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\GcodeArchiveWatcher.lnk"
-    $targetPath = $script:ScriptPath
+    $vbsPath = $script:ScriptPath -replace '\.ps1$', '.vbs'
     $wsh = $null
     try {
         $wsh = New-Object -ComObject WScript.Shell
         $shortcut = $wsh.CreateShortcut($shortcutPath)
-        $shortcut.TargetPath = "powershell.exe"
-        $shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$targetPath`" -StartNow"
-        $shortcut.WorkingDirectory = Split-Path $targetPath -Parent
-        $shortcut.IconLocation = $targetPath
+        $shortcut.TargetPath = "wscript.exe"
+        $shortcut.Arguments = "`"$vbsPath`" `"$script:ScriptPath`""
+        $shortcut.WorkingDirectory = Split-Path $script:ScriptPath -Parent
+        $shortcut.IconLocation = $script:ScriptPath
         $shortcut.Save()
+        Write-Log "Auto-start shortcut created: $shortcutPath -> $vbsPath"
     }
     finally {
         if ($wsh -ne $null) {
@@ -731,11 +764,214 @@ function Set-AutoStart {
     }
 }
 
+function Get-RemovableAndFixedDrives {
+    $drives = @()
+    try {
+        $logicalDisks = Get-WmiObject Win32_LogicalDisk -ErrorAction SilentlyContinue
+        foreach ($disk in $logicalDisks) {
+            # DriveType: 2=Removable, 3=Fixed
+            if ($disk.DriveType -eq 2 -or $disk.DriveType -eq 3) {
+                $drives += $disk.DeviceID + '\'
+            }
+        }
+    }
+    catch {
+        Write-Log "ERROR: Failed to query drives via WMI: $_"
+    }
+    return $drives
+}
+
+function Initialize-DriveWatcher {
+    # Set up WMI event watchers for USB drive insertion/removal using PowerShell events
+    try {
+        # Watch for drive insertion
+        $queryInsert = "SELECT * FROM __InstanceCreationEvent WITHIN 2 WHERE TargetInstance ISA 'Win32_LogicalDisk'"
+        $eventSinkInsert = New-Object Management.ManagementEventWatcher
+        $eventSinkInsert.Query = New-Object Management.WqlEventQuery($queryInsert)
+        
+        # Watch for drive removal
+        $queryRemove = "SELECT * FROM __InstanceDeletionEvent WITHIN 2 WHERE TargetInstance ISA 'Win32_LogicalDisk'"
+        $eventSinkRemove = New-Object Management.ManagementEventWatcher
+        $eventSinkRemove.Query = New-Object Management.WqlEventQuery($queryRemove)
+        
+        # Store references so we can stop them later
+        $script:WmiEventWatcher = @{
+            Insert = $eventSinkInsert
+            Remove = $eventSinkRemove
+        }
+        
+        Write-Log "WMI drive event watchers initialized"
+    }
+    catch {
+        Write-Log "WARNING: Failed to initialize WMI watchers: $_"
+        $script:WmiEventWatcher = $null
+    }
+}
+
+function Start-DriveWatcher {
+    if ($script:WmiEventWatcher) {
+        try {
+            # Start listening for WMI events using asynchronous event pattern
+            $script:WmiEventWatcher.Insert.Start()
+            $script:WmiEventWatcher.Remove.Start()
+            
+            # Register PowerShell event handlers for the events
+            Register-ObjectEvent -InputObject $script:WmiEventWatcher.Insert -EventName "EventArrived" -Action {
+                param($sender, $e)
+                $drive = $e.NewEvent.TargetInstance.DeviceID + '\'
+                Write-Log "WMI: Drive inserted event: $drive"
+                Refresh-DriveDetection
+            } | Out-Null
+            
+            Register-ObjectEvent -InputObject $script:WmiEventWatcher.Remove -EventName "EventArrived" -Action {
+                param($sender, $e)
+                $drive = $e.NewEvent.TargetInstance.DeviceID + '\'
+                Write-Log "WMI: Drive removed event: $drive"
+                Refresh-DriveDetection
+            } | Out-Null
+            
+            $script:DriveChangeEventsRegistered = $true
+            Write-Log "WMI drive event watchers started"
+        }
+        catch {
+            Write-Log "WARNING: Failed to start WMI watchers: $_"
+        }
+    }
+}
+
+function Stop-DriveWatcher {
+    if ($script:DriveChangeEventsRegistered) {
+        try {
+            # Unregister PowerShell events
+            Get-EventSubscriber | Where-Object { $_.SourceObject -eq $script:WmiEventWatcher.Insert -or $_.SourceObject -eq $script:WmiEventWatcher.Remove } | ForEach-Object {
+                Unregister-Event -SourceIdentifier $_.SourceIdentifier -Force
+            }
+            $script:DriveChangeEventsRegistered = $false
+        }
+        catch {
+            Write-Log "WARNING: Error unregistering WMI events: $_"
+        }
+    }
+    
+    if ($script:WmiEventWatcher) {
+        try {
+            $script:WmiEventWatcher.Insert.Stop()
+            $script:WmiEventWatcher.Remove.Stop()
+            $script:WmiEventWatcher.Insert.Dispose()
+            $script:WmiEventWatcher.Remove.Dispose()
+            Write-Log "WMI drive event watchers stopped"
+        }
+        catch {
+            Write-Log "WARNING: Error stopping WMI watchers: $_"
+        }
+        $script:WmiEventWatcher = $null
+    }
+}
+
+function Refresh-DriveDetection {
+    # Prevent concurrent executions
+    if ($script:DriveRefreshInProgress) {
+        return
+    }
+    $script:DriveRefreshInProgress = $true
+    
+    try {
+        Write-Log "Refreshing drive detection..."
+        
+        # Get current Fixed/Removable drives
+        $currentDrives = Get-RemovableAndFixedDrives
+        
+        # Lock drive list for modifications
+        [System.Threading.Monitor]::Enter($script:DriveListLock)
+        try {
+            # Find new drives - only add to watch list, don't scan contents
+            foreach ($drive in $currentDrives) {
+                $driveKey = $drive.ToLowerInvariant()
+                if (-not $script:WatchedDrives.ContainsKey($driveKey)) {
+                    Write-Log "New drive detected: $drive"
+                    $script:WatchedDrives[$driveKey] = $true
+                    $script:WatchPaths += $drive
+                    Write-Log "Now watching $drive"
+                    Show-BalloonTip "Drive Added" "Now monitoring $drive for G-code files" 1
+                }
+            }
+            
+            # Find removed drives
+            $pathsToRemove = @()
+            foreach ($path in $script:WatchPaths) {
+                if (-not ($currentDrives -contains $path)) {
+                    $pathKey = $path.ToLowerInvariant()
+                    if ($script:WatchedDrives.ContainsKey($pathKey)) {
+                        Write-Log "Drive removed: $path"
+                        $pathsToRemove += $path
+                    }
+                }
+            }
+            
+            # Clean up removed drives from watch list
+            if ($pathsToRemove.Count -gt 0) {
+                foreach ($path in $pathsToRemove) {
+                    $pathKey = $path.ToLowerInvariant()
+                    $script:WatchedDrives.Remove($pathKey) | Out-Null
+                }
+                $script:WatchPaths = $script:WatchPaths | Where-Object { $pathsToRemove -notcontains $_ }
+                Show-BalloonTip "Drive Removed" "$($pathsToRemove.Count) drive(s) removed from monitoring" 1
+            }
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($script:DriveListLock)
+        }
+        
+        # Remove KnownFiles entries for any removed drives (separate lock)
+        if ($pathsToRemove.Count -gt 0) {
+            [System.Threading.Monitor]::Enter($script:KnownFilesLock)
+            try {
+                foreach ($path in $pathsToRemove) {
+                    $pathKey = $path.ToLowerInvariant()
+                    $keysToRemove = @()
+                    foreach ($kvp in $script:KnownFiles.GetEnumerator()) {
+                        if ($kvp.Key.StartsWith($pathKey, [StringComparison]::OrdinalIgnoreCase)) {
+                            $keysToRemove += $kvp.Key
+                        }
+                    }
+                    foreach ($k in $keysToRemove) {
+                        $script:KnownFiles.Remove($k) | Out-Null
+                    }
+                }
+            }
+            finally {
+                [System.Threading.Monitor]::Exit($script:KnownFilesLock)
+            }
+         }
+     }
+     catch {
+         Write-Log "ERROR in Refresh-DriveDetection: $_"
+     }
+     finally {
+         $script:DriveRefreshInProgress = $false
+     }
+     
+    # Update cached USB detection state (fast, no logging)
+    $newUsbState = Get-UsbStateFast
+    if ($newUsbState -ne $script:CurrentUsbState) {
+        $script:CurrentUsbState = $newUsbState
+    }
+    
+    # Update tray icon color based on current drive state
+    Update-TrayIcon
+}
+
 function Remove-AutoStart {
     $shortcutPath = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\GcodeArchiveWatcher.lnk"
     if (Test-Path $shortcutPath) { Remove-Item $shortcutPath -Force }
 }
+
 #endregion
+
+# Pre-create tray icons for fast assignment
+$script:IconGreen = New-ColorIcon -Color ([System.Drawing.Color]::FromArgb(0,180,0))
+$script:IconRed = New-ColorIcon -Color ([System.Drawing.Color]::FromArgb(220,0,0))
+Write-Log "Icons created: Green=$($null -ne $script:IconGreen), Red=$($null -ne $script:IconRed)"
 
 #region Main
 if ($Install) {
@@ -763,9 +999,16 @@ $script:Notifier = Create-TrayIcon
 
 if ($script:Context.AutoStart) { Set-AutoStart }
 
+# Start watcher unconditionally - it's needed for both interactive and auto-start modes
+$watcherStarted = Start-Watcher
+if (-not $script:MainForm) {
+    Write-Log "FATAL: MainForm not created after Start-Watcher. Exiting."
+    exit 1
+}
+
 if ($StartNow) {
     Write-Log "=== G-Code Archive Watcher Starting ==="
-    if (Start-Watcher) {
+    if ($watcherStarted) {
         Write-Host "G-Code Archive Watcher started" -ForegroundColor Green
         Write-Host "Watching: $($script:Context.WatchPath)" -ForegroundColor Cyan
         Write-Host "Archive: $($script:Context.ArchiveRoot)" -ForegroundColor Cyan
@@ -779,17 +1022,24 @@ if ($StartNow) {
     }
 }
 
-# Ensure we have a form for the message loop, even if watcher not started
-if (-not $script:MainForm) {
-    $script:MainForm = New-Object System.Windows.Forms.Form
-    $script:MainForm.ShowInTaskbar = $false
-    $script:MainForm.WindowState = 'Minimized'
-    $script:MainForm.Size = New-Object System.Drawing.Size(0,0)
-    $script:MainForm.FormBorderStyle = 'None'
-    $script:MainForm.ShowIcon = $false
-    $script:MainForm.add_Shown({ $script:MainForm.Hide() })
+# Add diagnostic handlers
+if ($script:MainForm) {
+    $script:MainForm.add_FormClosed({ Write-Log "MainForm FormClosed event fired" })
+    $script:MainForm.add_FormClosing({ param($sender,$e) Write-Log "MainForm FormClosing: CloseReason=$($e.CloseReason)" })
+    $script:MainForm.add_Resize({ Write-Log "MainForm Resize: WindowState=$($script:MainForm.WindowState), Visible=$($script:MainForm.Visible), HandleCreated=$($script:MainForm.IsHandleCreated)" })
 }
-[System.Windows.Forms.Application]::Run($script:MainForm)
+
+Write-Log "Starting message loop (MainForm visible: $($script:MainForm.Visible))..."
+try {
+    [System.Windows.Forms.Application]::Run($script:MainForm)
+    Write-Log "Message loop exited normally"
+}
+catch {
+    Write-Log "ERROR in message loop: $_"
+}
+finally {
+    Write-Log "Message loop cleanup"
+}
 
 Stop-Watcher
 if ($script:Notifier) {
