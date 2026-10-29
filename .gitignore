@@ -15,3 +15,24 @@ desktop.ini
 
 # User-specific config (should stay in AppData)
 # config.xml lives in %APPDATA%, not in repo
+
+# Public-release cleanup: caches, local tooling, logs, backups
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+node_modules/
+.venv/
+venv/
+*.log
+tmp/
+temp/
+scratch/
+.idea/
+*.code-workspace
+.claude/
+.hermes/
+*.bak
+*.bak-*
+*.orig
+*~
